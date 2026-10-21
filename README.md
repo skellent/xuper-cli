@@ -22,10 +22,26 @@ The executable is `target/release/xuper-cli`. Install `mpv` to play streams.
 
 Search filters titles as you type. Use Up/Down to select, Enter to play, and Esc to exit. An optional complete Authorization header can be provided through `XUPER_AUTHORIZATION` for catalog requests.
 
+All catalog titles appear in search. `▶` means the entry has a direct stream URL; `·` means it only has metadata. Selecting a metadata-only title explains why playback is unavailable.
+
+For example, the public TVMaze catalog used during development can be browsed with:
+
+```sh
+./target/release/xuper-cli --url 'https://api.tvmaze.com/shows?page=0' --search
+```
+
+TVMaze provides show metadata, not playback URLs. It is a search example and is not a Xuper catalog.
+
 To try the terminal UI with a public demo video, run:
 
 ```sh
 ./target/release/xuper-cli --file examples/demo.m3u --search
 ```
 
-The APK is version 4.34.4 (`com.android.mgstv`). Its 13 KB `classes.dex` loads packed code, while `assets/domain_test.json` contains placeholder values. Static inspection has not exposed a usable media endpoint or a way to resolve an episode to a stream URL. The search and player flow can be connected to Xuper after that protocol is recovered.
+## Xuper protocol findings
+
+The APKs in `xuper/` are versions 4.34.4 and 4.99.20 of `com.android.mgstv`. Both are protected by packers. The newer APK's `assets/domain_test.json` still contains `xx` placeholders instead of server names. Its embedded strings name catalog routes such as `api/portalCore/v3/searchByName` and `api/portalCore/v10/startPlayVOD`, but do not provide a complete request format or a stable catalog host.
+
+An app-filtered packet capture of version 4.99.20 on 2026-10-21 confirmed that playback calls `http://yuwc.swzablvpm.com/slb/v13/vod`, then requests `/vod/..._idx.idxg` and `/vod/..._media.ts` from the same host. The `.ts` request has signed parameters including `token`, `sign2`, and `expired`; the POST body and response are opaque encoded data. A small ranged request from Linux returned MPEG transport stream data, and `ffprobe` identified HEVC video and AAC audio. The captured link expires, so it is not a reusable catalog source.
+
+The same capture saw HTTPS connections to `brkhzs.udigkkrc.com` and `tttopd.kj000zge.xyz` during catalog browsing. The encrypted requests prevent assigning a catalog route to either host yet. These observed domains may rotate and are not hardcoded into the CLI. The CLI still needs the app's catalog request and playback signing protocol to search Xuper directly.

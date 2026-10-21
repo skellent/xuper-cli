@@ -52,23 +52,27 @@ fn run() -> Result<(), Box<dyn Error>> {
                 && (action == "--random" || action == "--search") =>
         {
             let media = load_media(source, path)?;
-            let playable: Vec<&Media> = media
-                .iter()
-                .filter(|item| item.stream_url.is_some())
-                .collect();
-            if playable.is_empty() {
-                return Err("catalog has no direct stream URLs to play".into());
-            }
             let selected = if action == "--random" {
+                let playable: Vec<usize> = media
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, item)| item.stream_url.is_some())
+                    .map(|(index, _)| index)
+                    .collect();
+                if playable.is_empty() {
+                    return Err("catalog has no direct stream URLs to play".into());
+                }
                 let nanos = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
-                Some((nanos % playable.len() as u128) as usize)
+                Some(playable[(nanos % playable.len() as u128) as usize])
             } else {
-                search_media(&playable)?
+                search_media(&media)?
             };
             if let Some(index) = selected {
-                let item = playable[index];
+                let item = &media[index];
                 println!("Playing: {}", item.title);
-                play(item.stream_url.as_deref().expect("filtered playable items"))?;
+                if let Some(url) = &item.stream_url {
+                    play(url)?;
+                }
             }
             Ok(())
         }
@@ -89,6 +93,22 @@ fn is_stream_url(url: &str) -> bool {
     ["https://", "http://", "rtmp://", "rtsp://"]
         .iter()
         .any(|prefix| url.starts_with(prefix))
+}
+
+fn looks_like_media_file(url: &str) -> bool {
+    if !is_stream_url(url) {
+        return false;
+    }
+    let path = url
+        .split(['?', '#'])
+        .next()
+        .unwrap_or(url)
+        .to_ascii_lowercase();
+    [
+        ".m3u8", ".mpd", ".mp4", ".m4v", ".webm", ".ts", ".mov", ".mkv", ".flv",
+    ]
+    .iter()
+    .any(|extension| path.ends_with(extension))
 }
 
 fn load_media(source: &str, path: &str) -> Result<Vec<Media>, Box<dyn Error>> {
@@ -146,19 +166,17 @@ fn collect_json_media(value: &Value, parent: Option<&str>, out: &mut Vec<Media>,
     };
     let own_title = media_title(value);
     let title = own_title.or(parent);
-    let stream_url = [
-        "stream_url",
-        "play_url",
-        "video_url",
-        "direct_source",
-        "url",
-        "src",
-        "file",
-    ]
-    .into_iter()
-    .filter_map(|key| object.get(key).and_then(Value::as_str))
-    .find(|url| is_stream_url(url))
-    .map(str::to_owned);
+    let stream_url = ["stream_url", "play_url", "video_url", "direct_source"]
+        .into_iter()
+        .filter_map(|key| object.get(key).and_then(Value::as_str))
+        .find(|url| is_stream_url(url))
+        .or_else(|| {
+            ["url", "src", "file"]
+                .into_iter()
+                .filter_map(|key| object.get(key).and_then(Value::as_str))
+                .find(|url| looks_like_media_file(url))
+        })
+        .map(str::to_owned);
     if let Some(title) = title {
         if own_title.is_some() || stream_url.is_some() {
             out.push(Media {
@@ -265,13 +283,14 @@ impl Drop for TerminalGuard {
     }
 }
 
-fn search_media(media: &[&Media]) -> Result<Option<usize>, Box<dyn Error>> {
+fn search_media(media: &[Media]) -> Result<Option<usize>, Box<dyn Error>> {
     if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
         return Err("--search needs an interactive terminal".into());
     }
     let _guard = TerminalGuard::enter()?;
     let mut query = String::new();
     let mut selected = 0usize;
+    let mut notice: Option<String> = None;
     loop {
         let needle = query.to_lowercase();
         let matches: Vec<usize> = media
@@ -283,19 +302,26 @@ fn search_media(media: &[&Media]) -> Result<Option<usize>, Box<dyn Error>> {
         if selected >= matches.len() {
             selected = matches.len().saturating_sub(1);
         }
-        draw_search(media, &matches, selected, &query)?;
+        draw_search(media, &matches, selected, &query, notice.as_deref())?;
         if let Event::Key(key) = event::read()? {
             if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
                 continue;
             }
             match key.code {
                 KeyCode::Esc => return Ok(None),
-                KeyCode::Enter if !matches.is_empty() => return Ok(Some(matches[selected])),
+                KeyCode::Enter if !matches.is_empty() => {
+                    let item = &media[matches[selected]];
+                    if item.stream_url.is_some() {
+                        return Ok(Some(matches[selected]));
+                    }
+                    notice = Some(format!("{} has no stream URL in this catalog", item.title));
+                }
                 KeyCode::Up => selected = selected.saturating_sub(1),
                 KeyCode::Down if selected + 1 < matches.len() => selected += 1,
                 KeyCode::Backspace => {
                     query.pop();
                     selected = 0;
+                    notice = None;
                 }
                 KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                     return Ok(None);
@@ -303,6 +329,7 @@ fn search_media(media: &[&Media]) -> Result<Option<usize>, Box<dyn Error>> {
                 KeyCode::Char(ch) if !ch.is_control() => {
                     query.push(ch);
                     selected = 0;
+                    notice = None;
                 }
                 _ => {}
             }
@@ -311,10 +338,11 @@ fn search_media(media: &[&Media]) -> Result<Option<usize>, Box<dyn Error>> {
 }
 
 fn draw_search(
-    media: &[&Media],
+    media: &[Media],
     matches: &[usize],
     selected: usize,
     query: &str,
+    notice: Option<&str>,
 ) -> Result<(), Box<dyn Error>> {
     let (width, height) = terminal::size()?;
     let mut output = io::stdout();
@@ -322,19 +350,31 @@ fn draw_search(
         output,
         MoveTo(0, 0),
         Clear(ClearType::All),
-        Print("Search playable media  |  ↑/↓ select  Enter play  Esc quit"),
+        Print("Search media  |  ↑/↓ select  Enter play  Esc quit"),
         MoveTo(0, 1),
         Print(format!("Search: {query}")),
         MoveTo(0, 2),
-        Print(format!("{} matches", matches.len()))
+        Print(format!(
+            "{} matches  |  ▶ playable  · metadata only",
+            matches.len()
+        ))
     )?;
-    let rows = height.saturating_sub(3) as usize;
+    let rows = height.saturating_sub(4) as usize;
     let first = selected.saturating_sub(rows.saturating_sub(1));
     for (row, index) in matches.iter().skip(first).take(rows).enumerate() {
         let marker = if first + row == selected { "> " } else { "  " };
-        let label = format!("{marker}{}", media[*index].title);
+        let availability = if media[*index].stream_url.is_some() {
+            "▶"
+        } else {
+            "·"
+        };
+        let label = format!("{marker}{availability} {}", media[*index].title);
         let visible: String = label.chars().take(width as usize).collect();
         queue!(output, MoveTo(0, row as u16 + 3), Print(visible))?;
+    }
+    if let Some(notice) = notice {
+        let visible: String = notice.chars().take(width as usize).collect();
+        queue!(output, MoveTo(0, height.saturating_sub(1)), Print(visible))?;
     }
     output.flush()?;
     Ok(())
