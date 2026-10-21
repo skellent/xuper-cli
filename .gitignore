@@ -1,0 +1,8 @@
+# Xuper Android Binary
+xuper/xuper/
+
+# Temp Files
+temp/
+
+# Cargo
+/target
